@@ -1,0 +1,155 @@
+name: ensayo-build-inmutable
+# Temporary rehearsal (INT-100), not the project's CI. It builds the frontend on top of a node_modules sealed the way the
+# server's dependency publisher leaves it: every entry root-owned with no write bit (dirs 0555, files 0444, executables kept
+# executable) and the immutable attribute on the node_modules root only. Three trees:
+#   referencia  c1eb92e4, writable node_modules, the old build          -> reference dist
+#   control     c1eb92e4, sealed node_modules, the old build            -> must FAIL with EPERM on node_modules/.vite-temp
+#   arreglo     0748b93e, sealed node_modules, `vite build --configLoader runner` -> must PASS, write nothing, same dist
+# The job is green only when all three expectations hold.
+on:
+  push:
+    branches: [ensayo/23112026-build-inmutable]
+permissions:
+  contents: read
+concurrency:
+  group: ensayo-build-inmutable
+  cancel-in-progress: false
+jobs:
+  ensayo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      REPO: https://github.com/ProjectAppVentures/fernando_aragon_project.git
+      SHA_CONTROL: c1eb92e43ab0caaf7420f30f4982b2ed12e73edf
+      SHA_ARREGLO: 0748b93e15f0177f2e5da583f70ac49bd09495f5
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Entorno
+        run: |
+          echo "node $(node --version) · npm $(npm --version) · kernel $(uname -r) · usuario $(id -un) · fs $(stat -f -c %T "$GITHUB_WORKSPACE")"
+
+      - name: Clonar referencia, control y arreglo
+        run: |
+          set -eu
+          for d in referencia control arreglo; do git clone -q "$REPO" "$d"; done
+          git -C referencia -c advice.detachedHead=false checkout -q --detach "$SHA_CONTROL"
+          git -C control -c advice.detachedHead=false checkout -q --detach "$SHA_CONTROL"
+          git -C arreglo -c advice.detachedHead=false checkout -q --detach "$SHA_ARREGLO"
+          for d in referencia control arreglo; do echo "$d: $(git -C "$d" rev-parse HEAD) · build: $(grep -o '"build": "[^"]*"' "$d/frontend/package.json")"; done
+
+      - name: npm ci en los 3 (como runner, sin sudo)
+        run: |
+          set -eu
+          for d in referencia control arreglo; do
+            (cd "$d/frontend" && npm ci > "$GITHUB_WORKSPACE/npm-ci-$d.txt" 2>&1)
+            echo "$d: npm ci ok · entradas en node_modules: $(ls -A "$d/frontend/node_modules" | wc -l)"
+          done
+
+      - name: Build de referencia (node_modules escribible, el build de siempre)
+        run: |
+          set -eu
+          cd referencia/frontend
+          npm run build > "$GITHUB_WORKSPACE/build-referencia.txt" 2>&1
+          echo "referencia: build ok"
+
+      - name: Sellar node_modules del control y del arreglo como el publicador del servidor
+        run: |
+          set -eu
+          for d in control arreglo; do
+            if [ -e "$d/frontend/node_modules/.vite-temp" ]; then echo "$d: ya hay un .vite-temp antes de sellar: el ensayo no vale"; exit 1; fi
+            echo "$d: sin .vite-temp previo"
+            sudo python3 -I -S -B - "$GITHUB_WORKSPACE/$d/frontend/node_modules" <<'PY'
+          import os, stat, subprocess, sys
+          root = sys.argv[1]
+          def walk_bottom_up(top):
+              for dirpath, dirnames, filenames in os.walk(top, topdown=False, followlinks=False):
+                  for name in filenames + dirnames:
+                      yield os.path.join(dirpath, name)
+              yield top
+          for path in walk_bottom_up(root):
+              st = os.lstat(path)
+              if stat.S_ISLNK(st.st_mode):
+                  os.chown(path, 0, 0, follow_symlinks=False)
+                  continue
+              if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+                  raise SystemExit(f"special dependency entry is refused: {path}")
+              os.chown(path, 0, 0, follow_symlinks=False)
+              mode = stat.S_IMODE(st.st_mode) & ~0o222
+              if stat.S_ISDIR(st.st_mode):
+                  mode |= 0o555
+              else:
+                  mode |= 0o444
+                  if mode & stat.S_IXUSR:
+                      mode |= 0o111
+              os.chmod(path, mode, follow_symlinks=False)
+          subprocess.run(["/usr/bin/chattr", "+i", "--", root], check=True)
+          PY
+            echo "$d: $(stat -c '%U:%G %a' "$d/frontend/node_modules") · atributos $(lsattr -d "$d/frontend/node_modules" | cut -d' ' -f1) · escribibles por alguien: $(find "$d/frontend/node_modules" -perm /222 ! -type l | wc -l)"
+          done
+
+      - name: Build del control sobre el sellado (tiene que fallar)
+        id: control
+        run: |
+          cd control/frontend
+          set +e
+          npm run build > "$GITHUB_WORKSPACE/build-control.txt" 2>&1
+          rc=$?
+          set -e
+          echo "control: rc=$rc"
+          grep -n -E 'EPERM|EACCES|vite-temp|failed to load config' "$GITHUB_WORKSPACE/build-control.txt" | head -5 || true
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Build del arreglo sobre el sellado (tiene que pasar sin escribir)
+        id: arreglo
+        run: |
+          cd arreglo/frontend
+          antes=$(find node_modules -printf '%P %y %m %s\n' | sort | sha256sum | cut -c1-16)
+          set +e
+          npm run build > "$GITHUB_WORKSPACE/build-arreglo.txt" 2>&1
+          rc=$?
+          set -e
+          despues=$(find node_modules -printf '%P %y %m %s\n' | sort | sha256sum | cut -c1-16)
+          echo "arreglo: rc=$rc · node_modules (nombres, tipos, modos y tamaños) antes $antes · después $despues"
+          tail -5 "$GITHUB_WORKSPACE/build-arreglo.txt"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "nm_igual=$( [ "$antes" = "$despues" ] && echo si || echo no )" >> "$GITHUB_OUTPUT"
+
+      - name: Veredicto
+        env:
+          RC_CONTROL: ${{ steps.control.outputs.rc }}
+          RC_ARREGLO: ${{ steps.arreglo.outputs.rc }}
+          NM_IGUAL: ${{ steps.arreglo.outputs.nm_igual }}
+        run: |
+          set -u
+          cd "$GITHUB_WORKSPACE"
+          dist_sha() { (cd "$1/frontend" && find dist -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16); }
+          ok=1
+          eperm=$(grep -c -E 'EPERM.*vite-temp|vite-temp.*EPERM' build-control.txt || true)
+          [ "$RC_CONTROL" != 0 ] && [ "$eperm" -gt 0 ] && c="FALLA con EPERM en .vite-temp (esperado)" || { c="NO falló como se esperaba (rc=$RC_CONTROL, EPERM+vite-temp: $eperm)"; ok=0; }
+          [ "$RC_ARREGLO" = 0 ] && a="PASA (rc 0)" || { a="FALLA (rc=$RC_ARREGLO)"; ok=0; }
+          vt=$( [ -e arreglo/frontend/node_modules/.vite-temp ] && echo sí || echo no ); [ "$vt" = no ] || ok=0
+          tj=$(ls -A arreglo/frontend | grep -c -E '^vite\.config\..*timestamp' || true); [ "$tj" = 0 ] || ok=0
+          [ "$NM_IGUAL" = si ] || ok=0
+          ref=$(dist_sha referencia); arr=$( [ -d arreglo/frontend/dist ] && dist_sha arreglo || echo "(sin dist)" )
+          if [ "$ref" = "$arr" ]; then d="IGUAL ($ref)"; else d="DISTINTO: referencia $ref · arreglo $arr"; ok=0
+            echo "--- diff de nombres y tamaños (referencia vs arreglo) ---"
+            diff <(cd referencia/frontend && find dist -type f -printf '%P %s\n' | sort) <(cd arreglo/frontend && find dist -type f -printf '%P %s\n' 2>/dev/null | sort) || true
+          fi
+          {
+            echo "## Ensayo INT-100: build sobre node_modules sellado"
+            echo "- control (c1eb92e4, build de siempre): $c"
+            echo "- arreglo (0748b93e, --configLoader runner): $a · .vite-temp: $vt · temporales junto al config: $tj · node_modules sin cambios: $NM_IGUAL"
+            echo "- node: $(node --version)"
+            echo "- dist del arreglo contra la referencia (c1eb92e4 sin sellar): $d"
+            echo "- veredicto: $( [ "$ok" = 1 ] && echo VERDE || echo ROJO )"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$ok" = 1 ]
+
+      - name: Quitar el atributo inmutable (limpieza)
+        if: always()
+        run: |
+          for d in control arreglo; do sudo chattr -i -- "$GITHUB_WORKSPACE/$d/frontend/node_modules" 2>/dev/null || true; done
+          echo "limpieza hecha"
